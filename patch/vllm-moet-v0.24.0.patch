@@ -1502,7 +1502,7 @@ index d51a2dd31..2fe74cc55 100644
          raise ValueError(
              f"{self.__class__.__name__} uses the new modular kernel initialization "
              "logic. This function should not be called."
-@@ -1548,10 +1644,56 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
+@@ -1548,10 +1644,59 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
          )
          layer.register_parameter("w2_input_scale", w2_input_scale)
  
@@ -1525,7 +1525,10 @@ index d51a2dd31..2fe74cc55 100644
 +                # requant fires on the last, staging drops in place) —
 +                # peak host RAM stays O(layers in flight), not
 +                # O(checkpoint). Fallback: classic all-layers CPU staging.
-+                if not moe_w2_cubit.arm_stream_build(layer):
++                if not moe_w2_cubit.arm_stream_build(layer,
++                        build_fn=moe_w2_cubit.build_layer_planes_nvfp4,
++                        extra_params=("w13_weight_scale_2",
++                                      "w2_weight_scale_2")):
 +                    for pname in ("w13_weight", "w13_weight_scale",
 +                                  "w2_weight", "w2_weight_scale"):
 +                        p_ = getattr(layer, pname)
@@ -1593,37 +1596,47 @@ diff --git a/vllm/model_executor/layers/quantization/mxfp4.py b/vllm/model_execu
 index 1b2a8a74b..3afdb16fd 100644
 --- a/vllm/model_executor/layers/quantization/mxfp4.py
 +++ b/vllm/model_executor/layers/quantization/mxfp4.py
-@@ -617,6 +617,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+@@ -617,6 +617,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
              )
              layer.register_parameter("w2_bias", w2_bias)
              set_weight_attrs(w2_bias, extra_weight_attrs)
 +        # VLLM_MOE_W2: the raw checkpoint experts of all layers do not fit a
 +        # single GPU; stage them in host RAM until the 2-bit planes are built
-+        # in process_weights_after_loading.
++        # in process_weights_after_loading. Loader-level skip first: a layer
++        # the pack store already serves (boot-from-pack sidecar hit) needs NO
++        # checkpoint staging at all — plan_pack_skip stubs the big params and
++        # disarms their loaders. Stream-build next: per-layer lazy staging
++        # with immediate requant on last shard, peak = O(layers in flight).
 +        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
 +        if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
-+            for pname in ("w13_weight", "w13_weight_scale", "w2_weight",
-+                          "w2_weight_scale"):
-+                p_ = getattr(layer, pname)
-+                attrs = {k: getattr(p_, k) for k in ("weight_loader",)
-+                         if hasattr(p_, k)}
-+                newp = torch.nn.Parameter(p_.data.cpu(), requires_grad=False)
-+                layer.register_parameter(pname, newp)
-+                set_weight_attrs(newp, attrs)
-+                if pname.endswith("_scale"):
-+                    newp.quant_method = "block"
++            if not moe_w2_cubit.plan_pack_skip(layer):
++                if not moe_w2_cubit.arm_stream_build(layer,
++                        build_fn=moe_w2_cubit.build_layer_planes):
++                    for pname in ("w13_weight", "w13_weight_scale",
++                                  "w2_weight", "w2_weight_scale"):
++                        p_ = getattr(layer, pname)
++                        attrs = {k: getattr(p_, k) for k in ("weight_loader",)
++                                 if hasattr(p_, k)}
++                        newp = torch.nn.Parameter(p_.data.cpu(),
++                                                  requires_grad=False)
++                        layer.register_parameter(pname, newp)
++                        set_weight_attrs(newp, attrs)
++                        if pname.endswith("_scale"):
++                            newp.quant_method = "block"
  
      def _setup_kernel(
          self,
-@@ -722,6 +737,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+@@ -722,6 +737,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
              )
  
      def process_weights_after_loading(self, layer):
 +        # VLLM_MOE_W2: build 2-bit tensor-sym planes; skip Marlin/other backends.
 +        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
 +        if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
-+            key = len(moe_w2_cubit._LAYERS)
-+            moe_w2_cubit.build_layer_planes(layer, key)
++            key = getattr(layer, "_moe_w2_create_key",
++                          len(moe_w2_cubit._LAYERS))
++            if not getattr(layer, "_moe_w2_stream_built", False):
++                moe_w2_cubit.build_layer_planes(layer, key)
 +            layer._moe_w2_key = key
 +            return
 +
@@ -1671,7 +1684,7 @@ new file mode 100644
 index 000000000..43bad76a2
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,1702 @@
+@@ -0,0 +1,1747 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -2113,10 +2126,11 @@ index 000000000..43bad76a2
 +    A load arriving after the build would be silent data loss (the params
 +    are stubs by then) — fail loudly instead."""
 +
-+    def __init__(self, layer, pname, inner):
++    def __init__(self, layer, pname, inner, build_fn):
 +        self._layer = layer
 +        self._pname = pname
 +        self._inner = inner
++        self._build_fn = build_fn
 +
 +    def __call__(self, param, loaded_weight, *args, **kwargs):
 +        # LAZY staging: the create hook left this param as a 0-byte stub
@@ -2143,7 +2157,7 @@ index 000000000..43bad76a2
 +        pend[self._pname] -= 1
 +        if all(v == 0 for v in pend.values()):
 +            key = self._layer._moe_w2_create_key
-+            build_layer_planes_nvfp4(self._layer, key)
++            self._build_fn(self._layer, key)
 +            # Drop the staging storage IN PLACE on the ORIGINAL Parameter
 +            # objects. _finish_layer replaced the layer's attributes with
 +            # stub Parameters, but load_weights' params_dict (built once,
@@ -2160,14 +2174,20 @@ index 000000000..43bad76a2
 +        return ret
 +
 +
-+def arm_stream_build(layer) -> bool:
++def arm_stream_build(layer, build_fn=None, extra_params=None) -> bool:
 +    """Arm the streaming per-layer build on a layer plan_pack_skip missed
 +    (first boot, or a store that does not yet hold it). Expected loads per
 +    param: w13-side shards land twice per expert (w1, w3), w2-side once —
-+    exact counts over ALL SIX params the requant reads (including scale_2:
-+    building before they land would bake uninitialized per-tensor scales
-+    into the planes AND the caches), so completeness needs no
++    exact counts over all tracked params (including extra_params like
++    scale_2: building before they land would bake uninitialized per-tensor
++    scales into the planes AND the caches), so completeness needs no
 +    checkpoint-ordering assumption.
++
++    build_fn: (layer, key) -> None, the per-path requant function
++      (build_layer_planes, build_layer_planes_fp8, build_layer_planes_nvfp4).
++    extra_params: additional param names (beyond the standard four big
++      params) that must be counted before the build fires — e.g. the NVFP4
++      per-tensor scale_2 params.
 +
 +    Staging is LAZY: the four big params become 0-byte stubs here and a
 +    layer's buffers materialize on its FIRST loaded tensor (the up-front
@@ -2185,17 +2205,20 @@ index 000000000..43bad76a2
 +    except Exception:  # noqa: BLE001 - unexpected layout: staged path
 +        return False
 +    expected = {"w13_weight": 2 * E, "w13_weight_scale": 2 * E,
-+                "w13_weight_scale_2": 2 * E,
-+                "w2_weight": E, "w2_weight_scale": E,
-+                "w2_weight_scale_2": E}
++                "w2_weight": E, "w2_weight_scale": E}
++    if extra_params:
++        for p in extra_params:
++            expected[p] = 2 * E if p.startswith("w13") else E
 +    big = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
++    if build_fn is None:
++        build_fn = build_layer_planes_nvfp4
 +    wrappers = {}
 +    for pname in expected:
 +        p = getattr(layer, pname, None)
 +        inner = getattr(p, "weight_loader", None)
 +        if p is None or inner is None:
 +            return False                # leave the layer fully staged
-+        wrappers[pname] = (p, _StreamLoader(layer, pname, inner))
++        wrappers[pname] = (p, _StreamLoader(layer, pname, inner, build_fn))
 +    layer._moe_w2_pending = expected
 +    # originals of the BIG params: their storage is dropped in place at
 +    # build time, and their SHAPES feed the lazy materialization
@@ -2280,6 +2303,33 @@ index 000000000..43bad76a2
 +    """
 +    assert _ensure_ready(), "moe_w2 cubins missing"
 +    dev = torch.device("cuda")
++    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++    if getattr(layer, "_moe_w2_pack_skip", False):
++        # loader-level skip: the params are 0-byte stubs (plan_pack_skip),
++        # shapes travel via the create-time stash. The probed store MUST
++        # still serve the layer — there is no checkpoint copy to fall
++        # back to.
++        E, N13, K13, N2, K2 = layer._moe_w2_shapes
++        _require_kernels(K13, K2, need_w4=moe_w2_delta.enabled())
++        if moe_w2_delta.base_enabled():
++            assert _try_skip_requant(
++                layer, layer_key, E, N13, K13, N2, K2,
++                ("w13_weight", "w13_weight_scale", "w2_weight",
++                 "w2_weight_scale")), (
++                f"moe_w2: layer {layer_key} was loader-skipped on a pack "
++                f"sidecar hit but the pack no longer serves it "
++                f"(dir/sidecar changed mid-load?) — restart without the "
++                f"stale VLLM_MOE_W2_STORE_DIR state")
++            return
++        # GPU-resident: materialize the planes from the planes cache
++        # (probed at create time; a miss here means the cache dir changed
++        # under a live load).
++        assert _consume_planes_cache(layer, layer_key, dev,
++                                     E, N13, K13, N2, K2), (
++            f"moe_w2: layer {layer_key} was loader-skipped on a planes-"
++            f"cache hit but the cache no longer serves it — restart "
++            f"without the stale VLLM_MOE_W2_PLANES_CACHE state")
++        return
 +    w13 = layer.w13_weight.data          # [E, 2I, H/2] u8 (cpu)
 +    s13 = layer.w13_weight_scale.data    # [E, 2I, H/32] u8
 +    w2 = layer.w2_weight.data            # [E, H, I/2] u8
@@ -2287,7 +2337,6 @@ index 000000000..43bad76a2
 +    E, N13, _ = w13.shape
 +    _, N2, _ = w2.shape
 +    K13, K2 = N2, N13 // 2               # H, I (4096/2048 on DS4-Flash TP1)
-+    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
 +    _require_kernels(K13, K2, need_w4=moe_w2_delta.enabled())
 +    if _try_skip_requant(layer, layer_key, E, N13, K13, N2, K2,
 +                         ("w13_weight", "w13_weight_scale", "w2_weight",
