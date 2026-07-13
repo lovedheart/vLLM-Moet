@@ -1854,12 +1854,15 @@ index 000000000..c0ffee001
 +) -> torch.Tensor:
 +    """Forward pass through a CPU-resident MoE layer via lk_moe.
 +
-+    Two paths:
++    Three paths:
 +    1. CUDA-graph capture / decode: call lk_moe.cpu_decode() which reads
 +       GPU pointers directly (no synchronization, graph-safe).
-+    2. Prefill / non-graph: transfer hidden_states to CPU, call
-+       lk_moe.cpu_prefill(), transfer result back.
-+    """
++    2. GPU prefill (VLLM_MOE_W2_CPU_GPU_PREFILL_MIN_TOKENS > 0 and
++       batch size >= threshold): call lk_moe.gpu_prefill() — everything
++       stays on GPU, no H2D/D2H.  Useful for long-prefill bursts where
++       PCIe round-trips would dominate.
++    3. CPU prefill (default): full H2D → compute → D2H cycle via
++       lk_moe.cpu_prefill()."""
 +    if cpu_key >= len(_CPU_LAYER_LIST):
 +        raise IndexError(f"cpu_key {cpu_key} out of range "
 +                         f"(have {len(_CPU_LAYER_LIST)} layers)")
@@ -1880,7 +1883,23 @@ index 000000000..c0ffee001
 +        )
 +        return _get_output_buffer(x.size(0), entry["hidden"], x.dtype)
 +
-+    # Prefill / non-graph path: full H2D → compute → D2H cycle.
++    # GPU prefill path: stay on GPU when the batch is large enough.
++    _gpu_prefill_min = int(os.getenv(
++        "VLLM_MOE_W2_CPU_GPU_PREFILL_MIN_TOKENS", "0"))
++    if _gpu_prefill_min > 0 and x.size(0) >= _gpu_prefill_min:
++        output = torch.empty_like(x)
++        handle.gpu_prefill(
++            x.data_ptr(),
++            output.data_ptr(),
++            topk_ids.data_ptr(),
++            topk_weights.data_ptr(),
++            x.size(0),
++            topk_ids.size(1),
++            torch.cuda.current_stream().cuda_stream,
++        )
++        return output
++
++    # CPU prefill path: full H2D → compute → D2H cycle.
 +    expert_ids_cpu = topk_ids.to(dtype=torch.int32, device="cpu",
 +                                 non_blocking=True)
 +    weights_cpu = topk_weights.to(dtype=torch.float32, device="cpu",
