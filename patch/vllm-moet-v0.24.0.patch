@@ -1646,7 +1646,11 @@ index 1b2a8a74b..3afdb16fd 100644
      def process_weights_after_loading(self, layer):
 +        # VLLM_MOE_W2: build 2-bit tensor-sym planes; skip Marlin/other backends.
 +        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
-+        if moe_w2_cubit.is_cpu_layer(getattr(layer, "layer_name", "")):
++        _ln = getattr(layer, "layer_name", "")
++        _cpu = moe_w2_cubit.is_cpu_layer(_ln)
++        _w2 = moe_w2_cubit.is_w2_layer(_ln)
++        logger.info("moe_w2: process_weights layer=%s cpu=%s w2=%s", _ln, _cpu, _w2)
++        if moe_w2_cubit.is_cpu_layer(_ln):
 +            # CPU-resident FP4 layer: initialise lk_moe with the checkpoint
 +            # MXFP4 weights.  If lk_moe init fails (e.g. NUMA unavailable),
 +            # fall through to the 2-bit path instead.
@@ -2148,13 +2152,24 @@ index 000000000..43bad76a2
 +    raw = os.getenv("VLLM_MOE_W2_CPU_LAYERS", "")
 +    if not raw.strip():
 +        return set()
++    # lk_moe requires NUMA (libnuma).  Check both the Python import and
++    # the native numa_available() call — some containers have the lib but
++    # no NUMA nodes (e.g. single-socket or Docker default cgroup).
 +    try:
 +        import lk_moe  # noqa: F401
-+    except ImportError:
++        import ctypes
++        numa = ctypes.CDLL("libnuma.so.1")
++        if numa.numa_available() == -1:
++            logger.warning(
++                "moe_w2: VLLM_MOE_W2_CPU_LAYERS=%s set but NUMA is not "
++                "available on this system — CPU-labelled layers will fall "
++                "back to the 2-bit GPU path", raw)
++            return set()
++    except (ImportError, OSError, AttributeError) as e:
 +        logger.warning(
-+            "moe_w2: VLLM_MOE_W2_CPU_LAYERS=%s set but lk_moe not installed "
-+            "-- CPU-labelled layers will fall back to the 2-bit GPU path",
-+            raw)
++            "moe_w2: VLLM_MOE_W2_CPU_LAYERS=%s set but lk_moe/NUMA "
++            "initialisation failed: %s — falling back to 2-bit GPU path",
++            raw, e)
 +        return set()
 +    out = set()
 +    for part in raw.replace(" ", "").split(","):
