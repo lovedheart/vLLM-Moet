@@ -1648,13 +1648,24 @@ index 1b2a8a74b..3afdb16fd 100644
 +        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
 +        if moe_w2_cubit.is_cpu_layer(getattr(layer, "layer_name", "")):
 +            # CPU-resident FP4 layer: initialise lk_moe with the checkpoint
-+            # MXFP4 weights (e2m1 codes + block scales, no global scale).
++            # MXFP4 weights.  If lk_moe init fails (e.g. NUMA unavailable),
++            # fall through to the 2-bit path instead.
 +            from vllm.model_executor.layers.quantization.utils import (
 +                moe_w2_cpu)
-+            key = len(moe_w2_cpu._CPU_LAYER_LIST)
-+            moe_w2_cpu.init_cpu_layer_mxfp4(layer, key)
-+            layer._moe_w2_cpu_key = key
-+            return
++            try:
++                key = len(moe_w2_cpu._CPU_LAYER_LIST)
++                moe_w2_cpu.init_cpu_layer_mxfp4(layer, key)
++                layer._moe_w2_cpu_key = key
++                return
++            except Exception as e:
++                logger.error(
++                    "moe_w2: CPU layer %s init failed: %s. "
++                    "Falling back to 2-bit GPU path (set "
++                    "VLLM_MOE_W2_CPU_LAYERS=0 to silence).",
++                    getattr(layer, "layer_name", "?"), e)
++                # Clear the empty entry that may have been appended
++                if moe_w2_cpu._CPU_LAYER_LIST:
++                    moe_w2_cpu._CPU_LAYER_LIST.pop()
 +        if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
 +            key = getattr(layer, "_moe_w2_create_key",
 +                          len(moe_w2_cubit._LAYERS))
@@ -2154,6 +2165,7 @@ index 000000000..43bad76a2
 +            out.update(range(int(lo), int(hi) + 1))
 +        else:
 +            out.add(int(part))
++    logger.info("moe_w2: CPU layers configured: %s (lk_moe available)", out)
 +    return out
 +
 +_CPU_LAYERS = _cpu_layers_set()
@@ -2166,7 +2178,9 @@ index 000000000..43bad76a2
 +    m = re.search(r"\.layers\.(\d+)\.", layer_name or "")
 +    if m is None:
 +        return False
-+    return int(m.group(1)) in _CPU_LAYERS
++    idx = int(m.group(1))
++    result = idx in _CPU_LAYERS
++    return result
 +
 +
 +def _driver():

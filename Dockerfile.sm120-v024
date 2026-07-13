@@ -108,9 +108,11 @@ RUN SP="$(python3 -c 'import vllm, os; print(os.path.dirname(os.path.dirname(vll
 ENV VLLM_NVFP4_DS_MLA_EXT_DIR=/opt/nvfp4-ds-mla
 
 # 6. lk_moe CPU MoE kernel (optional; needed only when
-#    VLLM_MOE_W2_CPU_LAYERS is set).  Provide the wheel as a build arg
-#    or bind-mount it at build time.  Without it the image works fine
-#    for GPU-only 2-bit serving.
-# ARG LK_MOE_WHEEL
-# COPY ${LK_MOE_WHEEL} /tmp/lk_moe.whl
-# RUN pip install --no-cache-dir --break-system-packages /tmp/lk_moe.whl && rm /tmp/lk_moe.whl
+#    VLLM_MOE_W2_CPU_LAYERS is set).  Provides NUMA-optimised CPU
+#    inference for MXFP4 / NVFP4 / FP8 MoE experts.
+#    libnuma-dev is required for NUMA-aware thread placement.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libnuma-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir --break-system-packages lk_moe==2.2.0 \
+    && python3 -c "import lk_moe; assert hasattr(lk_moe, 'MOE_MXFP4')"
