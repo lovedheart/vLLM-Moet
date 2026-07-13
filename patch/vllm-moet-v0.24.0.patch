@@ -1797,10 +1797,10 @@ index 000000000..c0ffee001
 +            f"{getattr(layer, 'layer_name', cpu_key)} requires it. "
 +            f"Install lk_moe or unset VLLM_MOE_W2_CPU_LAYERS.") from e
 +
-+    w13 = layer.w13_weight.data             # [E, 2I, H/2] u8 (gpu, UVA)
-+    s13 = layer.w13_weight_scale.data       # [E, 2I, H/32] u8
-+    w2  = layer.w2_weight.data              # [E, H, I/2] u8
-+    s2  = layer.w2_weight_scale.data        # [E, H, I/32] u8
++    w13 = layer.w13_weight                    # [E, 2I, H/2] u8 (gpu)
++    w13_s = layer.w13_weight_scale            # [E, 2I, H/32] u8
++    w2  = layer.w2_weight                     # [E, H, I/2] u8
++    w2_s  = layer.w2_weight_scale             # [E, H, I/32] u8
 +
 +    E, N13, K13h = w13.shape
 +    H = K13h * 2                            # hidden = 2 * packed dim
@@ -1815,8 +1815,8 @@ index 000000000..c0ffee001
 +    # Quant group sizes: block-32 for MXFP4 (e2m1 codes, 2 per byte)
 +    pack_ratio = 2
 +    unpack_factor = 2 if pack_ratio == 2 else 1
-+    groupN = w13.shape[1] // s13.shape[1]
-+    groupK = (w13.shape[2] * unpack_factor) // s13.shape[2]
++    groupN = w13.shape[1] // w13_s.shape[1]
++    groupK = (w13.shape[2] * unpack_factor) // w13_s.shape[2]
 +
 +    # TP info
 +    tp_size = getattr(layer, "tp_size", 1)
@@ -1846,11 +1846,19 @@ index 000000000..c0ffee001
 +
 +    w13_ptr = w13.contiguous().data_ptr()
 +    w2_ptr  = w2.contiguous().data_ptr()
-+    s13_ptr = s13.contiguous().data_ptr()
-+    s2_ptr  = s2.contiguous().data_ptr()
++    w13_s_ptr = w13_s.contiguous().data_ptr()
++    w2_s_ptr  = w2_s.contiguous().data_ptr()
 +
 +    # MOE_MXFP4(cfg, w13, w2, w13_scale, w2_scale, unused, unused)
-+    handle = lk_moe.MOE_MXFP4(cfg, w13_ptr, w2_ptr, s13_ptr, s2_ptr, 0, 0)
++    handle = lk_moe.MOE_MXFP4(cfg, w13_ptr, w2_ptr, w13_s_ptr, w2_s_ptr, 0, 0)
++
++    # lk_moe has copied the weight data internally — free the GPU
++    # tensors to recover VRAM for KV cache / 2-bit planes.
++    stub = torch.empty(0, dtype=torch.uint8, device="cpu")
++    for pname in ("w13_weight", "w13_weight_scale", "w2_weight",
++                  "w2_weight_scale"):
++        layer.register_parameter(pname,
++                                 torch.nn.Parameter(stub, requires_grad=False))
 +
 +    _CPU_LAYER_LIST.append({
 +        "key": cpu_key, "handle": handle, "hidden": H, "inter": I,
