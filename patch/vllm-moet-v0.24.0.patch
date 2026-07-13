@@ -2155,15 +2155,18 @@ index 000000000..43bad76a2
 +    # lk_moe requires NUMA (libnuma).  Check both the Python import and
 +    # the native numa_available() call — some containers have the lib but
 +    # no NUMA nodes (e.g. single-socket or Docker default cgroup).
++    # numactl --hardware lists nodes; numa_max_node() returns the highest
++    # node index (0 for single-node, -1 if unavailable).
 +    try:
 +        import lk_moe  # noqa: F401
 +        import ctypes
 +        numa = ctypes.CDLL("libnuma.so.1")
-+        if numa.numa_available() == -1:
++        if numa.numa_available() == -1 or numa.numa_max_node() < 0:
 +            logger.warning(
-+                "moe_w2: VLLM_MOE_W2_CPU_LAYERS=%s set but NUMA is not "
-+                "available on this system — CPU-labelled layers will fall "
-+                "back to the 2-bit GPU path", raw)
++                "moe_w2: VLLM_MOE_W2_CPU_LAYERS=%s set but NUMA nodes "
++                "not available (available=%d max_node=%d) — CPU-labelled "
++                "layers will fall back to 2-bit GPU path",
++                raw, numa.numa_available(), numa.numa_max_node())
 +            return set()
 +    except (ImportError, OSError, AttributeError) as e:
 +        logger.warning(

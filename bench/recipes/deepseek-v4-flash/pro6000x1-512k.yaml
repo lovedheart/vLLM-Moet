@@ -25,7 +25,12 @@ serve_args:
   - --tokenizer-mode deepseek_v4
   - --no-scheduler-reserve-full-isl
   - --speculative-config {"method":"deepseek_mtp","num_speculative_tokens":2}
-  - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
+  - --compilation-config {"cudagraph_mode":"FULL_DECODE_ONLY","custom_ops":["all"]}
+
+# Notes:
+# - CPU layers (VLLM_MOE_W2_CPU_LAYERS) need --security-opt seccomp=unconfined
+#   or --privileged to allow NUMA syscalls (mbind) that lk_moe requires.
+#   Without it, CPU-labelled layers gracefully fall back to the 2-bit GPU path.
 
 suite_params:
   batch_decode:
