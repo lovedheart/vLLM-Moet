@@ -106,3 +106,11 @@ RUN SP="$(python3 -c 'import vllm, os; print(os.path.dirname(os.path.dirname(vll
     && TORCH_CUDA_ARCH_LIST=12.0a python3 -c \
        "from torch.utils.cpp_extension import load; load(name='nvfp4_ds_mla_cache_ext', sources=['$SP/csrc/nvfp4_ds_mla/concat_and_cache_nvfp4_ds_mla.cu'], extra_cuda_cflags=['-O3', '--generate-code=arch=compute_120a,code=sm_120a'], build_directory='/opt/nvfp4-ds-mla')"
 ENV VLLM_NVFP4_DS_MLA_EXT_DIR=/opt/nvfp4-ds-mla
+
+# 6. lk_moe CPU MoE kernel (optional; needed only when
+#    VLLM_MOE_W2_CPU_LAYERS is set).  Provide the wheel as a build arg
+#    or bind-mount it at build time.  Without it the image works fine
+#    for GPU-only 2-bit serving.
+# ARG LK_MOE_WHEEL
+# COPY ${LK_MOE_WHEEL} /tmp/lk_moe.whl
+# RUN pip install --no-cache-dir --break-system-packages /tmp/lk_moe.whl && rm /tmp/lk_moe.whl
