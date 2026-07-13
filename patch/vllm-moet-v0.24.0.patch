@@ -1609,14 +1609,19 @@ index 1b2a8a74b..3afdb16fd 100644
 +        # with immediate requant on last shard, peak = O(layers in flight).
 +        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
 +        if moe_w2_cubit.is_cpu_layer(getattr(layer, "layer_name", "")):
-+            # CPU-resident FP4 layer (lk_moe): weights stay on CPU at
-+            # checkpoint precision — no GPU staging, no 2-bit quant.
++            # CPU-resident FP4 layer (lk_moe): weights STAY ON GPU and are
++            # accessed by lk_moe via UVA (Unified Virtual Addressing) —
++            # Lvllmds4 passes GPU data_ptrs to MOE_MXFP4, and lk_moe reads
++            # them from the CPU side through PCIe.  Importantly: do NOT
++            # move weights to CPU — lk_moe's MOE_MXFP4 constructor reads
++            # the GPU memory directly (UVA) and a CPU pointer would cause
++            # a segfault.
 +            for pname in ("w13_weight", "w13_weight_scale", "w2_weight",
 +                          "w2_weight_scale"):
 +                p_ = getattr(layer, pname)
 +                attrs = {k: getattr(p_, k) for k in ("weight_loader",)
 +                         if hasattr(p_, k)}
-+                newp = torch.nn.Parameter(p_.data.cpu(), requires_grad=False)
++                newp = torch.nn.Parameter(p_.data, requires_grad=False)
 +                layer.register_parameter(pname, newp)
 +                set_weight_attrs(newp, attrs)
 +                if pname.endswith("_scale"):
@@ -1792,7 +1797,7 @@ index 000000000..c0ffee001
 +            f"{getattr(layer, 'layer_name', cpu_key)} requires it. "
 +            f"Install lk_moe or unset VLLM_MOE_W2_CPU_LAYERS.") from e
 +
-+    w13 = layer.w13_weight.data             # [E, 2I, H/2] u8 (cpu)
++    w13 = layer.w13_weight.data             # [E, 2I, H/2] u8 (gpu, UVA)
 +    s13 = layer.w13_weight_scale.data       # [E, 2I, H/32] u8
 +    w2  = layer.w2_weight.data              # [E, H, I/2] u8
 +    s2  = layer.w2_weight_scale.data        # [E, H, I/32] u8
