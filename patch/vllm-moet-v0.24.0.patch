@@ -1608,6 +1608,20 @@ index 1b2a8a74b..3afdb16fd 100644
 +        # disarms their loaders. Stream-build next: per-layer lazy staging
 +        # with immediate requant on last shard, peak = O(layers in flight).
 +        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
++        if moe_w2_cubit.is_cpu_layer(getattr(layer, "layer_name", "")):
++            # CPU-resident FP4 layer (lk_moe): weights stay on CPU at
++            # checkpoint precision — no GPU staging, no 2-bit quant.
++            for pname in ("w13_weight", "w13_weight_scale", "w2_weight",
++                          "w2_weight_scale"):
++                p_ = getattr(layer, pname)
++                attrs = {k: getattr(p_, k) for k in ("weight_loader",)
++                         if hasattr(p_, k)}
++                newp = torch.nn.Parameter(p_.data.cpu(), requires_grad=False)
++                layer.register_parameter(pname, newp)
++                set_weight_attrs(newp, attrs)
++                if pname.endswith("_scale"):
++                    newp.quant_method = "block"
++            return
 +        if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
 +            if not moe_w2_cubit.plan_pack_skip(layer):
 +                if not moe_w2_cubit.arm_stream_build(layer,
@@ -1632,6 +1646,15 @@ index 1b2a8a74b..3afdb16fd 100644
      def process_weights_after_loading(self, layer):
 +        # VLLM_MOE_W2: build 2-bit tensor-sym planes; skip Marlin/other backends.
 +        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
++        if moe_w2_cubit.is_cpu_layer(getattr(layer, "layer_name", "")):
++            # CPU-resident FP4 layer: initialise lk_moe with the checkpoint
++            # MXFP4 weights (e2m1 codes + block scales, no global scale).
++            from vllm.model_executor.layers.quantization.utils import (
++                moe_w2_cpu)
++            key = len(moe_w2_cpu._CPU_LAYER_LIST)
++            moe_w2_cpu.init_cpu_layer_mxfp4(layer, key)
++            layer._moe_w2_cpu_key = key
++            return
 +        if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
 +            key = getattr(layer, "_moe_w2_create_key",
 +                          len(moe_w2_cubit._LAYERS))
@@ -1651,6 +1674,14 @@ index 1b2a8a74b..3afdb16fd 100644
 +        # Shared experts are orchestrated by the MoE runner (pre/post
 +        # _maybe_apply_shared_experts); the non-modular w2 path returns only the
 +        # routed-expert output, matching the other non-modular applies here.
++        cpu_key = getattr(layer, "_moe_w2_cpu_key", None)
++        if cpu_key is not None:
++            from vllm.model_executor.layers.quantization.utils import (
++                moe_w2_cpu)
++            assert layer.expert_map is None and \
++                not layer.apply_router_weight_on_input
++            return moe_w2_cpu.cpu_moe_forward(x, topk_weights, topk_ids,
++                                              cpu_key)
 +        w2_key = getattr(layer, "_moe_w2_key", None)
 +        if w2_key is not None:
 +            from vllm.model_executor.layers.quantization.utils import (
@@ -1679,6 +1710,203 @@ index 32a2d8689..3e83d5a87 100644
          dg_ws = deepgemm_post_process_weight_scale_block(
              ws=ws,
              mn=r,
+diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cpu.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cpu.py
+new file mode 100644
+index 000000000..c0ffee001
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cpu.py
+@@ -0,0 +1,217 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU-resident FP4 MoE layers via the lk_moe NUMA-optimised kernel.
++
++Normally VLLM_MOE_W2=1 quantises EVERY routed expert to 2-bit and serves
++them from GPU.  With VLLM_MOE_W2_CPU_LAYERS=e.g. "0-2,40-42", the listed
++layers keep checkpoint FP4 precision and run on CPU via lk_moe while the
++middle layers stay at 2-bit on GPU.  lk_moe is an *optional* dependency
++-- without it the labelled layers fall back to the 2-bit path.
++
++lk_moe is imported lazily at init time (import inside init_cpu_layer_*),
++so the module itself loads regardless of whether lk_moe is installed."""
++
++import os
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++# Per-layer state: cpu_key -> lk_moe handle + metadata
++_CPU_LAYER_LIST: list[dict] = []
++
++# CUDA-graph output buffer (single pre-allocated tensor, reused across
++# all CPU layers during capture — same pattern as RoutedExperts.output_gpu
++# in Lvllm).
++_output_gpu: torch.Tensor | None = None
++_cuda_graph_sizes: list[int] | None = None
++
++
++def _init_cuda_graph_buffers(max_batch: int, hidden: int):
++    global _output_gpu, _cuda_graph_sizes
++    if _cuda_graph_sizes is None:
++        _cuda_graph_sizes = [1, 2, 4] + list(range(8, max_batch + 1, 8))
++    dev = torch.cuda.current_device()
++    _output_gpu = torch.zeros(
++        (max_batch, hidden), device=dev, dtype=torch.float32,
++        requires_grad=False).contiguous()
++
++
++def _get_output_buffer(n_tokens: int, hidden: int, dtype) -> torch.Tensor:
++    if _output_gpu is not None and n_tokens <= _output_gpu.shape[0]:
++        return _output_gpu[:n_tokens].to(dtype)
++    return torch.empty(n_tokens, hidden, device="cuda", dtype=dtype)
++
++
++def init_cpu_layer_mxfp4(layer, cpu_key: int) -> None:
++    """Initialise lk_moe.MOE_MXFP4 for one MXFP4-checkpoint layer.
++
++    The layer's weights (w13_weight, w13_weight_scale, w2_weight,
++    w2_weight_scale) must be CPU-resident at this point.  This mirrors
++    Lvllm's RoutedExperts._process_mxfp4()."""
++    try:
++        import lk_moe
++    except ImportError as e:
++        raise RuntimeError(
++            f"moe_w2_cpu: lk_moe not installed but CPU layer "
++            f"{getattr(layer, 'layer_name', cpu_key)} requires it. "
++            f"Install lk_moe or unset VLLM_MOE_W2_CPU_LAYERS.") from e
++
++    w13 = layer.w13_weight.data             # [E, 2I, H/2] u8 (cpu)
++    s13 = layer.w13_weight_scale.data       # [E, 2I, H/32] u8
++    w2  = layer.w2_weight.data              # [E, H, I/2] u8
++    s2  = layer.w2_weight_scale.data        # [E, H, I/32] u8
++
++    E, N13, K13h = w13.shape
++    H = K13h * 2                            # hidden = 2 * packed dim
++    _, N2, I2h = w2.shape
++    I = I2h * 2                             # intermediate
++
++    # Per-rank dimensions (TP-sliced)
++    inter_per_part = N13 // 2               # I after gate+up merge
++    local_experts = E
++    top_k = getattr(layer, "top_k", 8)
++
++    # Quant group sizes: block-32 for MXFP4 (e2m1 codes, 2 per byte)
++    pack_ratio = 2
++    unpack_factor = 2 if pack_ratio == 2 else 1
++    groupN = w13.shape[1] // s13.shape[1]
++    groupK = (w13.shape[2] * unpack_factor) // s13.shape[2]
++
++    # TP info
++    tp_size = getattr(layer, "tp_size", 1)
++    tp_rank = getattr(layer, "tp_rank", 0)
++    gpu_id = torch.cuda.current_device()
++
++    # Batch size caps (conservative defaults; tuned by Lvllm)
++    max_batch = int(os.getenv("VLLM_MOE_W2_CPU_MAX_BATCH", "8192"))
++    max_seqs = int(os.getenv("VLLM_MOE_W2_CPU_MAX_SEQS", "256"))
++
++    cfg = lk_moe.MOEConfigV2()
++    cfg.num_processes = tp_size
++    cfg.process_id = tp_rank
++    cfg.gpu_id = gpu_id
++    cfg.has_gate_proj = getattr(layer, "has_gate_proj", True)
++    cfg.expert_num = local_experts
++    cfg.top_k = top_k
++    cfg.hidden_size = H
++    cfg.intermediate_size = inter_per_part
++    cfg.max_batch_size = max_batch
++    cfg.max_num_seqs = max_seqs
++    cfg.stride = 32
++    cfg.group_min_len = 10
++    cfg.group_max_len = max_batch
++    cfg.groupN = groupN
++    cfg.groupK = groupK
++
++    w13_ptr = w13.contiguous().data_ptr()
++    w2_ptr  = w2.contiguous().data_ptr()
++    s13_ptr = s13.contiguous().data_ptr()
++    s2_ptr  = s2.contiguous().data_ptr()
++
++    # MOE_MXFP4(cfg, w13, w2, w13_scale, w2_scale, unused, unused)
++    handle = lk_moe.MOE_MXFP4(cfg, w13_ptr, w2_ptr, s13_ptr, s2_ptr, 0, 0)
++
++    _CPU_LAYER_LIST.append({
++        "key": cpu_key, "handle": handle, "hidden": H, "inter": I,
++        "tp_size": tp_size, "top_k": top_k,
++    })
++
++    _init_cuda_graph_buffers(max_batch, H)
++
++    logger.info("moe_w2_cpu: layer %d (name=%s) initialised on CPU "
++                "(lk_moe MXFP4, E=%d H=%d I=%d, %.2f GiB weights)",
++                cpu_key, getattr(layer, "layer_name", "?"),
++                E, H, I, (w13.nbytes + s13.nbytes + w2.nbytes + s2.nbytes)
++                / 2**30)
++
++
++def cpu_moe_forward(
++    x: torch.Tensor,
++    topk_weights: torch.Tensor,
++    topk_ids: torch.Tensor,
++    cpu_key: int,
++) -> torch.Tensor:
++    """Forward pass through a CPU-resident MoE layer via lk_moe.
++
++    Two paths:
++    1. CUDA-graph capture / decode: call lk_moe.cpu_decode() which reads
++       GPU pointers directly (no synchronization, graph-safe).
++    2. Prefill / non-graph: transfer hidden_states to CPU, call
++       lk_moe.cpu_prefill(), transfer result back.
++    """
++    if cpu_key >= len(_CPU_LAYER_LIST):
++        raise IndexError(f"cpu_key {cpu_key} out of range "
++                         f"(have {len(_CPU_LAYER_LIST)} layers)")
++    entry = _CPU_LAYER_LIST[cpu_key]
++    handle = entry["handle"]
++
++    if torch.cuda.is_current_stream_capturing():
++        # CUDA-graph path: lk_moe reads GPU pointers directly.
++        stream_ptr = torch.cuda.current_stream().cuda_stream
++        handle.cpu_decode(
++            stream_ptr,
++            x.size(0),
++            entry["top_k"],
++            x.data_ptr(),
++            topk_ids.data_ptr(),
++            topk_weights.data_ptr(),
++            _output_gpu.data_ptr(),
++        )
++        return _get_output_buffer(x.size(0), entry["hidden"], x.dtype)
++
++    # Prefill / non-graph path: full H2D → compute → D2H cycle.
++    expert_ids_cpu = topk_ids.to(dtype=torch.int32, device="cpu",
++                                 non_blocking=True)
++    weights_cpu = topk_weights.to(dtype=torch.float32, device="cpu",
++                                   non_blocking=True)
++    hidden_cpu = x.to(device="cpu", non_blocking=True)
++    output_cpu = torch.empty_like(hidden_cpu, dtype=torch.float32,
++                                   device="cpu")
++
++    torch.cuda.current_stream().synchronize()
++
++    handle.cpu_prefill(
++        x.size(0),
++        expert_ids_cpu.size(1),
++        expert_ids_cpu.data_ptr(),
++        weights_cpu.data_ptr(),
++        hidden_cpu.data_ptr(),
++        output_cpu.data_ptr(),
++    )
++
++    return output_cpu.to(torch.cuda.current_device(),
++                         dtype=x.dtype, non_blocking=True)
++
++
++# -----------------------------------------------------------------
++# FILES.txt entry (appended by the patch regeneration automaton)
++# -----------------------------------------------------------------
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
 index 000000000..43bad76a2
@@ -1859,7 +2087,8 @@ index 000000000..43bad76a2
 +    """Main-model routed experts only. The MTP drafter (layer index >=
 +    num_hidden_layers, e.g. model.layers.43.* for the 43-layer main stack)
 +    keeps its original path: QUANT_PROBE's acceptance numbers were
-+    measured with the drafter unmodified."""
++    measured with the drafter unmodified. CPU layers (VLLM_MOE_W2_CPU_LAYERS)
++    are also excluded — they keep FP4 precision and run on CPU via lk_moe."""
 +    if not enabled():
 +        return False
 +    name = layer_name or ""
@@ -1869,7 +2098,56 @@ index 000000000..43bad76a2
 +    m = re.search(r"\.layers\.(\d+)\.", name)
 +    if m is None:
 +        return False
++    if is_cpu_layer(name):
++        return False
 +    return int(m.group(1)) < _layer_cutoff()
++
++
++# ---- CPU-resident FP4 layers (VLLM_MOE_W2_CPU_LAYERS) --------------------
++# Layers listed in this env var keep the CHECKPOINT FP4 precision and run on
++# CPU via the lk_moe NUMA-optimized kernel.  Typical use: first and last N
++# layers at FP4 for accuracy, middle layers at 2-bit for speed.  The lk_moe
++# package is an optional dependency — without it, CPU-labelled layers fall
++# back to the 2-bit GPU path (and log a warning at parse time).
++#
++#   VLLM_MOE_W2_CPU_LAYERS    e.g. "0-2,40-42" (first 3 + last 3 layers)
++#   VLLM_MOE_W2_CPU_THREADS   CPU threads per layer (default: phys cores - 4)
++#   LVLLM_ENABLE_NUMA_INTERLEAVE  1 = interleave=all NUMA policy
++
++def _cpu_layers_set() -> set:
++    raw = os.getenv("VLLM_MOE_W2_CPU_LAYERS", "")
++    if not raw.strip():
++        return set()
++    try:
++        import lk_moe  # noqa: F401
++    except ImportError:
++        logger.warning(
++            "moe_w2: VLLM_MOE_W2_CPU_LAYERS=%s set but lk_moe not installed "
++            "-- CPU-labelled layers will fall back to the 2-bit GPU path",
++            raw)
++        return set()
++    out = set()
++    for part in raw.replace(" ", "").split(","):
++        if not part:
++            continue
++        if "-" in part:
++            lo, hi = part.split("-", 1)
++            out.update(range(int(lo), int(hi) + 1))
++        else:
++            out.add(int(part))
++    return out
++
++_CPU_LAYERS = _cpu_layers_set()
++
++def is_cpu_layer(layer_name: str) -> bool:
++    """True when this layer should run FP4 on CPU via lk_moe."""
++    if not _CPU_LAYERS:
++        return False
++    import re
++    m = re.search(r"\.layers\.(\d+)\.", layer_name or "")
++    if m is None:
++        return False
++    return int(m.group(1)) in _CPU_LAYERS
 +
 +
 +def _driver():
