@@ -1311,50 +1311,47 @@ index 051468ed1..9e5cc3dad 100644
  
          # Enforce that we enough for at least 1 page per request
 diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py
-index 7cdb04cfb..64813139b 100644
+index 7cdb04cfb..518710a9f 100644
 --- a/vllm/model_executor/layers/quantization/fp8.py
 +++ b/vllm/model_executor/layers/quantization/fp8.py
-@@ -671,6 +671,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+@@ -671,6 +671,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
              layer.w13_input_scale = None
              layer.w2_input_scale = None
  
-+        # VLLM_MOE_W2: the raw fp8 checkpoint experts of all layers do not fit
-+        # the GPU during load; stage them in host RAM until the 2-bit planes
-+        # are built in process_weights_after_loading. Block-quant models only
-+        # (DS4-Flash-FP8, GLM-5.2-FP8).
++        # VLLM_MOE_W2: stream the raw fp8 checkpoint experts on GPU, quantize
++        # per-layer as its last tensor arrives (no CPU RAM for raw FP8 staging).
 +        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
 +        if self.block_quant and moe_w2_cubit.is_w2_layer(
 +                getattr(layer, "layer_name", "")):
-+            for pname in ("w13_weight", f"w13_{self.weight_scale_name}",
-+                          "w2_weight", f"w2_{self.weight_scale_name}"):
-+                p_ = getattr(layer, pname)
-+                attrs = dict(p_.__dict__)  # weight_loader, quant_method, ...
-+                newp = torch.nn.Parameter(p_.data.cpu(), requires_grad=False)
-+                layer.register_parameter(pname, newp)
-+                set_weight_attrs(newp, attrs)
++            moe_w2_cubit.arm_stream_build(
++                layer, build_fn=moe_w2_cubit.build_layer_planes_fp8)
 +
      def _setup_kernel(
          self,
          layer: RoutedExperts,
-@@ -717,6 +732,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+@@ -717,6 +725,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
              )
  
      def process_weights_after_loading(self, layer: RoutedExperts) -> None:
 +        # VLLM_MOE_W2: re-quantize the host-staged fp8 experts to 2-bit
 +        # tensor-sym planes; skip the stock kernel setup entirely.
++        # When the streaming build already handled this layer during load,
++        # skip the requant and just register the key.
 +        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
 +        if self.block_quant and moe_w2_cubit.is_w2_layer(
 +                getattr(layer, "layer_name", "")):
-+            key = len(moe_w2_cubit._LAYERS)
-+            moe_w2_cubit.build_layer_planes_fp8(
-+                layer, key, scale_suffix=self.weight_scale_name)
++            key = getattr(layer, "_moe_w2_create_key",
++                          len(moe_w2_cubit._LAYERS))
++            if not getattr(layer, "_moe_w2_stream_built", False):
++                moe_w2_cubit.build_layer_planes_fp8(
++                    layer, key, scale_suffix=self.weight_scale_name)
 +            layer._moe_w2_key = key
 +            return
 +
          # Allow for accessing weights and scales in standard way.
          w13 = layer.w13_weight
          w2 = layer.w2_weight
-@@ -837,6 +863,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+@@ -837,6 +860,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
          shared_experts: SharedExperts | None,
          shared_experts_input: torch.Tensor | None,
      ) -> torch.Tensor:
@@ -1375,7 +1372,7 @@ index 7cdb04cfb..64813139b 100644
          assert self.moe_kernel is not None
          return self.moe_kernel.apply(
 diff --git a/vllm/model_executor/layers/quantization/modelopt.py b/vllm/model_executor/layers/quantization/modelopt.py
-index d51a2dd31..2fe74cc55 100644
+index d51a2dd31..0b61696c5 100644
 --- a/vllm/model_executor/layers/quantization/modelopt.py
 +++ b/vllm/model_executor/layers/quantization/modelopt.py
 @@ -1,6 +1,7 @@
@@ -1502,7 +1499,7 @@ index d51a2dd31..2fe74cc55 100644
          raise ValueError(
              f"{self.__class__.__name__} uses the new modular kernel initialization "
              "logic. This function should not be called."
-@@ -1548,10 +1644,56 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
+@@ -1548,10 +1644,60 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
          )
          layer.register_parameter("w2_input_scale", w2_input_scale)
  
@@ -1525,7 +1522,11 @@ index d51a2dd31..2fe74cc55 100644
 +                # requant fires on the last, staging drops in place) —
 +                # peak host RAM stays O(layers in flight), not
 +                # O(checkpoint). Fallback: classic all-layers CPU staging.
-+                if not moe_w2_cubit.arm_stream_build(layer):
++                if not moe_w2_cubit.arm_stream_build(
++                        layer,
++                        build_fn=moe_w2_cubit.build_layer_planes_nvfp4,
++                        extra_params=["w13_weight_scale_2",
++                                      "w2_weight_scale_2"]):
 +                    for pname in ("w13_weight", "w13_weight_scale",
 +                                  "w2_weight", "w2_weight_scale"):
 +                        p_ = getattr(layer, pname)
@@ -1559,7 +1560,7 @@ index d51a2dd31..2fe74cc55 100644
  
          # Use a single gscale for w13.
          if self.moe.is_act_and_mul and not torch.allclose(
-@@ -1655,6 +1797,19 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
+@@ -1655,6 +1801,19 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
          shared_experts: SharedExperts | None,
          shared_experts_input: torch.Tensor | None,
      ) -> torch.Tensor:
@@ -1579,7 +1580,7 @@ index d51a2dd31..2fe74cc55 100644
          assert not self.is_monolithic
          assert self.moe_kernel is not None
          return self.moe_kernel.apply(
-@@ -2473,6 +2628,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
+@@ -2473,6 +2632,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
  
          # Excluded layers
          if self.is_layer_excluded(prefix):
@@ -1590,47 +1591,51 @@ index d51a2dd31..2fe74cc55 100644
                  return UnquantizedLinearMethod()
              return None
 diff --git a/vllm/model_executor/layers/quantization/mxfp4.py b/vllm/model_executor/layers/quantization/mxfp4.py
-index 1b2a8a74b..3afdb16fd 100644
+index 1b2a8a74b..34915b259 100644
 --- a/vllm/model_executor/layers/quantization/mxfp4.py
 +++ b/vllm/model_executor/layers/quantization/mxfp4.py
-@@ -617,6 +617,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+@@ -617,6 +617,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
              )
              layer.register_parameter("w2_bias", w2_bias)
              set_weight_attrs(w2_bias, extra_weight_attrs)
-+        # VLLM_MOE_W2: the raw checkpoint experts of all layers do not fit a
-+        # single GPU; stage them in host RAM until the 2-bit planes are built
-+        # in process_weights_after_loading.
++        # VLLM_MOE_W2: stream to GPU, quantize per-layer.
 +        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
 +        if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
-+            for pname in ("w13_weight", "w13_weight_scale", "w2_weight",
-+                          "w2_weight_scale"):
-+                p_ = getattr(layer, pname)
-+                attrs = {k: getattr(p_, k) for k in ("weight_loader",)
-+                         if hasattr(p_, k)}
-+                newp = torch.nn.Parameter(p_.data.cpu(), requires_grad=False)
-+                layer.register_parameter(pname, newp)
-+                set_weight_attrs(newp, attrs)
-+                if pname.endswith("_scale"):
-+                    newp.quant_method = "block"
++            if not moe_w2_cubit.arm_stream_build(
++                    layer, build_fn=moe_w2_cubit.build_layer_planes):
++                # Fallback: classic all-layers CPU staging.
++                for pname in ("w13_weight", "w13_weight_scale", "w2_weight",
++                              "w2_weight_scale"):
++                    p_ = getattr(layer, pname)
++                    attrs = {k: getattr(p_, k) for k in ("weight_loader",)
++                             if hasattr(p_, k)}
++                    newp = torch.nn.Parameter(p_.data.cpu(),
++                                              requires_grad=False)
++                    layer.register_parameter(pname, newp)
++                    set_weight_attrs(newp, attrs)
++                    if pname.endswith("_scale"):
++                        newp.quant_method = "block"
  
      def _setup_kernel(
          self,
-@@ -722,6 +737,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+@@ -722,6 +739,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
              )
  
      def process_weights_after_loading(self, layer):
 +        # VLLM_MOE_W2: build 2-bit tensor-sym planes; skip Marlin/other backends.
 +        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
 +        if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
-+            key = len(moe_w2_cubit._LAYERS)
-+            moe_w2_cubit.build_layer_planes(layer, key)
++            key = getattr(layer, "_moe_w2_create_key",
++                          len(moe_w2_cubit._LAYERS))
++            if not getattr(layer, "_moe_w2_stream_built", False):
++                moe_w2_cubit.build_layer_planes(layer, key)
 +            layer._moe_w2_key = key
 +            return
 +
          w13 = layer.w13_weight
          w2 = layer.w2_weight
          w13_scale = layer.w13_weight_scale
-@@ -779,6 +802,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+@@ -779,6 +806,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
          shared_experts: SharedExperts | None,
          shared_experts_input: torch.Tensor | None,
      ) -> torch.Tensor:
@@ -1668,10 +1673,10 @@ index 32a2d8689..3e83d5a87 100644
              mn=r,
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 000000000..371d388ed
+index 000000000..80411a267
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,1718 @@
+@@ -0,0 +1,1768 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -2124,24 +2129,27 @@ index 000000000..371d388ed
 +    """Per-param weight_loader wrapper: counts SUCCESSFUL (expert, shard)
 +    loads and triggers the layer build when every big param is complete.
 +    A load arriving after the build would be silent data loss (the params
-+    are stubs by then) — fail loudly instead."""
++    are stubs by then) — fail loudly instead.
 +
-+    def __init__(self, layer, pname, inner):
++    On the last load for a layer, calls ``build_fn(layer, key, **build_kwargs)``
++    to re-quantize DIRECTLY on GPU (no CPU staging). The staging buffer is
++    lazily allocated on GPU so the raw checkpoint data never sits in host RAM.
++    """
++
++    def __init__(self, layer, pname, inner, build_fn):
 +        self._layer = layer
 +        self._pname = pname
 +        self._inner = inner
++        self._build_fn = build_fn
 +
 +    def __call__(self, param, loaded_weight, *args, **kwargs):
-+        # LAZY staging: the create hook left this param as a 0-byte stub
-+        # (allocating every layer's host buffer up front peaked at ~300+ GB
-+        # before the first shard was even read — measured). Materialize the
-+        # layer's buffer the moment its first tensor arrives; with a
-+        # layer-major checkpoint only a couple of layers are ever
-+        # in-flight, an unordered one merely degrades to the old profile.
++        # LAZY staging GPU: the create hook left this param as a 0-byte stub.
++        # Materialize ON GPU the moment its first tensor arrives, so the raw
++        # checkpoint data never occupies host RAM.
 +        if param.data.numel() == 0:
 +            shape = self._layer._moe_w2_stream_shapes[self._pname]
 +            param.data = torch.empty(shape, dtype=param.data.dtype,
-+                                     device="cpu")
++                                     device="cuda")
 +        ret = self._inner(param, loaded_weight, *args, **kwargs)
 +        ok = (ret is True) if kwargs.get("return_success") else True
 +        if not ok:
@@ -2156,7 +2164,7 @@ index 000000000..371d388ed
 +        pend[self._pname] -= 1
 +        if all(v == 0 for v in pend.values()):
 +            key = self._layer._moe_w2_create_key
-+            build_layer_planes_nvfp4(self._layer, key)
++            self._build_fn(self._layer, key)
 +            # Drop the staging storage IN PLACE on the ORIGINAL Parameter
 +            # objects. _finish_layer replaced the layer's attributes with
 +            # stub Parameters, but load_weights' params_dict (built once,
@@ -2165,22 +2173,31 @@ index 000000000..371d388ed
 +            # and the "streaming" peak is the whole checkpoint again
 +            # (measured: 517 GB at 29/47 shards on GLM TP2).
 +            for p in self._layer._moe_w2_stream_orig:
-+                p.data = torch.empty(0, dtype=p.data.dtype, device="cpu")
++                p.data = torch.empty(0, dtype=p.data.dtype, device="cuda")
 +            self._layer._moe_w2_stream_orig = ()
 +            self._layer._moe_w2_stream_built = True
-+            logger.debug("moe_w2: layer key %d stream-built during load",
-+                         key)
++            logger.debug("moe_w2: layer key %d stream-built during load "
++                         "(GPU-staged)", key)
 +        return ret
 +
 +
-+def arm_stream_build(layer) -> bool:
++def arm_stream_build(layer, build_fn=None, extra_params=None) -> bool:
 +    """Arm the streaming per-layer build on a layer plan_pack_skip missed
 +    (first boot, or a store that does not yet hold it). Expected loads per
 +    param: w13-side shards land twice per expert (w1, w3), w2-side once —
-+    exact counts over ALL SIX params the requant reads (including scale_2:
-+    building before they land would bake uninitialized per-tensor scales
-+    into the planes AND the caches), so completeness needs no
-+    checkpoint-ordering assumption.
++    exact counts over all tracked params (including extra_params like
++    scale_2 or FP8 weight_scale_inv: building before they land would bake
++    uninitialized per-tensor scales into the planes AND the caches), so
++    completeness needs no checkpoint-ordering assumption.
++
++    build_fn: (layer, key) -> None, the per-path requant function
++      (build_layer_planes, build_layer_planes_fp8, build_layer_planes_nvfp4).
++      Default: build_layer_planes_nvfp4 (keeps NVFP4 / modelopt backward
++      compat).
++
++    extra_params: additional param names (beyond the standard four big
++      params) that must be counted before the build fires — e.g. NVFP4
++      per-tensor scale_2 params, or FP8 scale names.
 +
 +    Staging is LAZY: the four big params become 0-byte stubs here and a
 +    layer's buffers materialize on its FIRST loaded tensor (the up-front
@@ -2188,27 +2205,59 @@ index 000000000..371d388ed
 +    first shard was read — measured), then drop IN PLACE at build (the
 +    attribute swap alone frees nothing: load_weights' params_dict holds
 +    the original objects until the load returns — measured 517 GB).
++    Staging is on GPU so the raw checkpoint data never occupies host RAM.
 +    Returns True when armed (the caller then skips its own staging).
 +    No-op unless VLLM_MOE_W2_STREAM_BUILD=1 (default)."""
-+    global _stream_logged
++    global _stream_logged, _n_created
 +    if not (_STREAM and enabled()):
 +        return False
 +    try:
 +        E = layer.w13_weight.shape[0]
 +    except Exception:  # noqa: BLE001 - unexpected layout: staged path
 +        return False
-+    expected = {"w13_weight": 2 * E, "w13_weight_scale": 2 * E,
-+                "w13_weight_scale_2": 2 * E,
-+                "w2_weight": E, "w2_weight_scale": E,
-+                "w2_weight_scale_2": E}
-+    big = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
++    # assign a unique key matching plan_pack_skip's ordering
++    key = _n_created
++    _n_created += 1
++    layer._moe_w2_create_key = key
++
++    # Standard four big params: weight and block-scale tensors.
++    # The scale suffix differs by path: "_scale" for MXFP4/NVFP4,
++    # "_scale_inv" for block-FP8.
++    for sname in ("_scale", "_scale_inv"):
++        has_nv = hasattr(layer, f"w13_weight{sname}")
++        has_fp8 = hasattr(layer, f"w13_weight{sname}")
++        if has_nv or has_fp8:
++            scale_suffix = sname
++            break
++    else:
++        scale_suffix = "_scale"  # fallback
++
++    expected = {f"w13_weight": 2 * E,
++                f"w13_weight{scale_suffix}": 2 * E,
++                f"w2_weight": E,
++                f"w2_weight{scale_suffix}": E}
++    if extra_params:
++        for p in extra_params:
++            expected[p] = 2 * E if p.startswith("w13") else E
++
++    big = (f"w13_weight", f"w13_weight{scale_suffix}",
++           f"w2_weight", f"w2_weight{scale_suffix}")
++    if build_fn is None:
++        build_fn = build_layer_planes_nvfp4
 +    wrappers = {}
 +    for pname in expected:
 +        p = getattr(layer, pname, None)
++        if p is None:
++            return False
 +        inner = getattr(p, "weight_loader", None)
-+        if p is None or inner is None:
-+            return False                # leave the layer fully staged
-+        wrappers[pname] = (p, _StreamLoader(layer, pname, inner))
++        if inner is None:
++            # Params without an explicit weight_loader (should not happen
++            # in practice) use a simple copy.
++            def _cp(param, lw, *a, **kw):
++                param.data.copy_(lw)
++                return True if kw.get("return_success") else None
++            inner = _cp
++        wrappers[pname] = (p, _StreamLoader(layer, pname, inner, build_fn))
 +    layer._moe_w2_pending = expected
 +    # originals of the BIG params: their storage is dropped in place at
 +    # build time, and their SHAPES feed the lazy materialization
@@ -2217,15 +2266,14 @@ index 000000000..371d388ed
 +        p: tuple(getattr(layer, p).shape) for p in big}
 +    for pname in big:                   # lazy: nothing staged until loaded
 +        p = getattr(layer, pname)
-+        p.data = torch.empty(0, dtype=p.data.dtype, device="cpu")
++        p.data = torch.empty(0, dtype=p.data.dtype, device="cuda")
 +    for pname, (p, wrap) in wrappers.items():
 +        p.weight_loader = wrap
 +    if not _stream_logged:
 +        _stream_logged = True
 +        logger.info(
-+            "moe_w2 STREAM-BUILD armed: layer staging materializes on its "
-+            "first loaded tensor and requants on its last (peak staging = "
-+            "layers in flight, not the checkpoint); "
++            "moe_w2 STREAM-BUILD armed: layer staging materializes on "
++            "GPU, requants on its last (no CPU RAM for raw data); "
 +            "VLLM_MOE_W2_STREAM_BUILD=0 restores the old path")
 +    return True
 +
@@ -2364,12 +2412,14 @@ index 000000000..371d388ed
 +    """FP8 block-quant checkpoint variant of build_layer_planes (Fp8MoEMethod:
 +    DS4-Flash-FP8, GLM-5.2-FP8 — models without an FP4 release).
 +
-+    Reads the CPU-staged fp8 params (w13_weight [E,2I,H] e4m3 +
-+    w13_weight_scale_inv [E,ceil(2I/128),ceil(H/128)] f32 etc.), re-quantizes
-+    each expert on GPU to the sweep-validated 2-bit pipeline (block-32 UE8M0 +
-+    e2m1 snap + tensor-sym {-4,-1,1,4}; internal/glm52-sweep/sweep.py), packs
-+    fragment-major planes, then replaces the originals with empty stubs. The
-+    e2m1 nibbles of the same requant feed the optional FP4 delta tier.
++    Re-quantizes each expert on GPU to the sweep-validated 2-bit pipeline
++    (block-32 UE8M0 + e2m1 snap + tensor-sym {-4,-1,1,4}), packs fragment-
++    major planes, then replaces the originals with empty stubs. The e2m1
++    nibbles of the same requant feed the optional FP4 delta tier.
++
++    In the streaming path (``arm_stream_build_fp8``) the raw FP8 params are
++    already GPU-resident — the H2D copies below are skipped. In the classic
++    all-layers-CPU path they run as before.
 +    """
 +    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
 +    from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
@@ -2377,7 +2427,7 @@ index 000000000..371d388ed
 +
 +    assert _ensure_ready(), "moe_w2 cubins missing"
 +    dev = torch.device("cuda")
-+    w13 = layer.w13_weight.data                       # [E, 2I, H] e4m3 (cpu)
++    w13 = layer.w13_weight.data                       # [E, 2I, H] e4m3
 +    s13 = getattr(layer, f"w13_{scale_suffix}").data  # [E, 2I/128, H/128] f32
 +    w2 = layer.w2_weight.data                         # [E, H, I] e4m3
 +    s2 = getattr(layer, f"w2_{scale_suffix}").data    # [E, H/128, I/128] f32
@@ -2404,13 +2454,15 @@ index 000000000..371d388ed
 +        fp2 = torch.empty(E, _fp4_plane_nbytes(N2, K2),
 +                          dtype=torch.uint8, device=dev)
 +
-+    # fp8 experts are 4x the bytes of the mxfp4 path and the requant makes f32
-+    # temporaries -> smaller H2D chunks, per-expert quantize.
++    is_gpu = w13.device.type == "cuda"               # streaming: already on GPU
 +    chunk = 8
 +    for e0 in range(0, E, chunk):
 +        e1 = min(e0 + chunk, E)
-+        wg = w13[e0:e1].to(dev, non_blocking=True)
-+        sg = s13[e0:e1].to(dev, non_blocking=True)
++        if is_gpu:
++            wg, sg = w13[e0:e1], s13[e0:e1]
++        else:
++            wg = w13[e0:e1].to(dev, non_blocking=True)
++            sg = s13[e0:e1].to(dev, non_blocking=True)
 +        for i in range(e1 - e0):
 +            codes, sbytes, nib = fp8_block_to_codes_scales(
 +                wg[i], sg[i], want_nibbles=fp13 is not None)
@@ -2418,8 +2470,11 @@ index 000000000..371d388ed
 +            sc13[e0 + i] = pack_scales(sbytes)
 +            if fp13 is not None:
 +                fp13[e0 + i] = _pack_fp4_plane(nib)
-+        wg = w2[e0:e1].to(dev, non_blocking=True)
-+        sg = s2[e0:e1].to(dev, non_blocking=True)
++        if is_gpu:
++            wg, sg = w2[e0:e1], s2[e0:e1]
++        else:
++            wg = w2[e0:e1].to(dev, non_blocking=True)
++            sg = s2[e0:e1].to(dev, non_blocking=True)
 +        for i in range(e1 - e0):
 +            codes, sbytes, nib = fp8_block_to_codes_scales(
 +                wg[i], sg[i], want_nibbles=fp2 is not None)
@@ -5926,10 +5981,10 @@ index 000000000..f5de680cf
 +            f"(top-{_PILOT_K}, n={tot[1]})")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py b/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py
 new file mode 100644
-index 000000000..b061273a2
+index 000000000..eec747256
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py
-@@ -0,0 +1,369 @@
+@@ -0,0 +1,410 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""2-bit tensor-sym expert planes for the 1-GPU DeepSeek-V4 plan.
@@ -6177,6 +6232,13 @@ index 000000000..b061273a2
 +    identical L2 (|err| = 1 unit either way), deterministic. Balanced-zero
 +    checkpoints keep the validated sign-preserving map bit-exactly.
 +    VLLM_MOE_W2_ZERO_MODE={auto,sign,alt} overrides (default auto).
++
++    OPTIMAL SCALE (VLLM_MOE_W2_OPTIMAL_SCALE=1): instead of min-max
++    normalization (exp = round(log2(amax/6))), search a narrow window of
++    ue8m0 exponents around the min-max baseline and pick the one that
++    minimizes L2 error. This allows slight clipping of extreme values in
++    exchange for better representation of the bulk of weights.
++    VLLM_MOE_W2_OPTIMAL_WINDOW=N sets the search radius (default: 4).
 +    """
 +    assert w.dtype == torch.float64
 +    N, K = w.shape
@@ -6187,16 +6249,50 @@ index 000000000..b061273a2
 +    # blocks get the minimum exponent so the (zero -> +-1 code) dequant stays
 +    # ~2^-127 instead of poisoning the block with +-1.0.
 +    # exponent clamped to e8m0's [-127, 127] (byte 255 = NaN is never emitted)
-+    exp = torch.where(amax > 0,
-+                      torch.round(torch.log2(amax / 6.0 + 1e-30)),
-+                      torch.full_like(amax, -127.0)).clamp_(-127.0, 127.0)
-+    scale_bytes = (exp + 127.0).to(torch.uint8)
-+    u = wb / torch.exp2(exp).unsqueeze(2)     # exact: power-of-2 division
++    import os
++    baseline_exp = torch.where(amax > 0,
++                               torch.round(torch.log2(amax / 6.0 + 1e-30)),
++                               torch.full_like(amax, -127.0)).clamp_(-127.0, 127.0)
++
++    use_optimal = os.getenv("VLLM_MOE_W2_OPTIMAL_SCALE", "0") == "1"
++    search_window = int(os.getenv("VLLM_MOE_W2_OPTIMAL_WINDOW", "4"))
++
++    if use_optimal and search_window > 0:
++        # Least-squares optimal scale: search +/-search_window around baseline
++        # For each candidate exp, compute L2 error of the 2-bit requant
++        exp_candidates = torch.arange(
++            -search_window, search_window + 1,
++            dtype=torch.float64, device=w.device)
++        # [N, K//32, 1, 2*W+1]
++        exp_grid = (baseline_exp.unsqueeze(-1) +
++                    exp_candidates.unsqueeze(0).unsqueeze(0))
++        exp_grid = exp_grid.clamp(-127.0, 127.0)
++        # [N, K//32, 32, 2*W+1]
++        s_grid = torch.exp2(exp_grid).unsqueeze(2)
++        u_grid = wb.unsqueeze(-1) / s_grid
++        mag_grid = torch.bucketize(u_grid.abs(), _E2M1_MID.to(w.device))
++        neg_grid = torch.signbit(u_grid)
++        nib_grid = mag_grid | (neg_grid.to(torch.uint8) << 3)
++        code_grid = _NIBBLE_TO_CODE.to(w.device)[nib_grid.long()]
++        # code -> level {-4, -1, 1, 4}
++        levels = torch.tensor(
++            [-4.0, -1.0, 1.0, 4.0], dtype=torch.float64, device=w.device)
++        recon = levels[code_grid] * s_grid
++        err = ((wb.unsqueeze(-1) - recon) ** 2).sum(dim=2)
++        best_offset = torch.argmin(err, dim=-1)
++        exp = baseline_exp + (best_offset.to(torch.float64) - search_window)
++        scale_bytes = (exp + 127.0).to(torch.uint8)
++        # Recompute codes with optimal scale
++        u = wb / torch.exp2(exp).unsqueeze(2)
++    else:
++        exp = baseline_exp
++        scale_bytes = (exp + 127.0).to(torch.uint8)
++        u = wb / torch.exp2(exp).unsqueeze(2)
++
 +    mag = torch.bucketize(u.abs().reshape(N, K),
 +                          _E2M1_MID.to(w.device)).to(torch.uint8)
 +    neg = torch.signbit(u).reshape(N, K)
 +
-+    import os
 +    zero_mode = os.getenv("VLLM_MOE_W2_ZERO_MODE", "auto")
 +    if zero_mode != "sign":
 +        zero = (u == 0.0).reshape(N, K)
